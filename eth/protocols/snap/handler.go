@@ -23,14 +23,19 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core"
+	"github.com/ethereum/go-ethereum/core/rawdb"
+	"github.com/ethereum/go-ethereum/core/state/snapshot"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/metrics"
 	"github.com/ethereum/go-ethereum/p2p"
 	"github.com/ethereum/go-ethereum/p2p/enode"
 	"github.com/ethereum/go-ethereum/p2p/enr"
+	"github.com/ethereum/go-ethereum/p2p/tracker"
+	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/trie"
 	"github.com/ethereum/go-ethereum/trie/trienode"
+	"github.com/ethereum/go-ethereum/triedb/database"
 )
 
 const (
@@ -82,23 +87,16 @@ type Backend interface {
 }
 
 // MakeProtocols constructs the P2P protocol definitions for `snap`.
-func MakeProtocols(backend Backend, dnsdisc enode.Iterator) []p2p.Protocol {
-	// Filter the discovery iterator for nodes advertising snap support.
-	dnsdisc = enode.Filter(dnsdisc, func(n *enode.Node) bool {
-		var snap enrEntry
-		return n.Load(&snap) == nil
-	})
-
+func MakeProtocols(backend Backend) []p2p.Protocol {
 	protocols := make([]p2p.Protocol, len(ProtocolVersions))
 	for i, version := range ProtocolVersions {
-		version := version // Closure
-
 		protocols[i] = p2p.Protocol{
 			Name:    ProtocolName,
 			Version: version,
 			Length:  protocolLengths[version],
 			Run: func(p *p2p.Peer, rw p2p.MsgReadWriter) error {
 				return backend.RunPeer(NewPeer(version, p, rw), func(peer *Peer) error {
+					defer peer.Close()
 					return Handle(backend, peer)
 				})
 			},
@@ -108,8 +106,7 @@ func MakeProtocols(backend Backend, dnsdisc enode.Iterator) []p2p.Protocol {
 			PeerInfo: func(id enode.ID) interface{} {
 				return backend.PeerInfo(id)
 			},
-			Attributes:     []enr.Entry{&enrEntry{}},
-			DialCandidates: dnsdisc,
+			Attributes: []enr.Entry{&enrEntry{}},
 		}
 	}
 	return protocols
@@ -141,7 +138,7 @@ func HandleMessage(backend Backend, peer *Peer) error {
 	defer msg.Discard()
 	start := time.Now()
 	// Track the amount of time it takes to serve the request and run the handler
-	if metrics.Enabled {
+	if metrics.Enabled() {
 		h := fmt.Sprintf("%s/%s/%d/%#02x", p2p.HandleHistName, ProtocolName, peer.Version(), msg.Code)
 		defer func(start time.Time) {
 			sampler := func() metrics.Sample {
@@ -155,7 +152,6 @@ func HandleMessage(backend Backend, peer *Peer) error {
 	// Handle the message depending on its contents
 	switch {
 	case msg.Code == GetAccountRangeMsg:
-		// Decode the account retrieval request
 		var req GetAccountRangePacket
 		if err := msg.Decode(&req); err != nil {
 			return fmt.Errorf("%w: message %v: %v", errDecode, msg, err)
@@ -171,23 +167,40 @@ func HandleMessage(backend Backend, peer *Peer) error {
 		})
 
 	case msg.Code == AccountRangeMsg:
-		// A range of accounts arrived to one of our previous requests
-		res := new(AccountRangePacket)
+		res := new(accountRangeInput)
 		if err := msg.Decode(res); err != nil {
 			return fmt.Errorf("%w: message %v: %v", errDecode, msg, err)
 		}
+
+		// Check response validity.
+		if len := res.Proof.Len(); len > 128 {
+			return fmt.Errorf("AccountRange: invalid proof (length %d)", len)
+		}
+		tresp := tracker.Response{ID: res.ID, MsgCode: AccountRangeMsg, Size: len(res.Accounts.Content())}
+		if err := peer.tracker.Fulfil(tresp); err != nil {
+			return err
+		}
+
+		// Decode.
+		accounts, err := res.Accounts.Items()
+		if err != nil {
+			return fmt.Errorf("AccountRange: invalid accounts list: %v", err)
+		}
+		proof, err := res.Proof.Items()
+		if err != nil {
+			return fmt.Errorf("AccountRange: invalid proof: %v", err)
+		}
+
 		// Ensure the range is monotonically increasing
-		for i := 1; i < len(res.Accounts); i++ {
-			if bytes.Compare(res.Accounts[i-1].Hash[:], res.Accounts[i].Hash[:]) >= 0 {
-				return fmt.Errorf("accounts not monotonically increasing: #%d [%x] vs #%d [%x]", i-1, res.Accounts[i-1].Hash[:], i, res.Accounts[i].Hash[:])
+		for i := 1; i < len(accounts); i++ {
+			if bytes.Compare(accounts[i-1].Hash[:], accounts[i].Hash[:]) >= 0 {
+				return fmt.Errorf("accounts not monotonically increasing: #%d [%x] vs #%d [%x]", i-1, accounts[i-1].Hash[:], i, accounts[i].Hash[:])
 			}
 		}
-		requestTracker.Fulfil(peer.id, peer.version, AccountRangeMsg, res.ID)
 
-		return backend.Handle(peer, res)
+		return backend.Handle(peer, &AccountRangePacket{res.ID, accounts, proof})
 
 	case msg.Code == GetStorageRangesMsg:
-		// Decode the storage retrieval request
 		var req GetStorageRangesPacket
 		if err := msg.Decode(&req); err != nil {
 			return fmt.Errorf("%w: message %v: %v", errDecode, msg, err)
@@ -203,25 +216,42 @@ func HandleMessage(backend Backend, peer *Peer) error {
 		})
 
 	case msg.Code == StorageRangesMsg:
-		// A range of storage slots arrived to one of our previous requests
-		res := new(StorageRangesPacket)
+		res := new(storageRangesInput)
 		if err := msg.Decode(res); err != nil {
 			return fmt.Errorf("%w: message %v: %v", errDecode, msg, err)
 		}
+
+		// Check response validity.
+		if len := res.Proof.Len(); len > 128 {
+			return fmt.Errorf("StorageRangesMsg: invalid proof (length %d)", len)
+		}
+		tresp := tracker.Response{ID: res.ID, MsgCode: StorageRangesMsg, Size: len(res.Slots.Content())}
+		if err := peer.tracker.Fulfil(tresp); err != nil {
+			return fmt.Errorf("StorageRangesMsg: %w", err)
+		}
+
+		// Decode.
+		slotLists, err := res.Slots.Items()
+		if err != nil {
+			return fmt.Errorf("AccountRange: invalid accounts list: %v", err)
+		}
+		proof, err := res.Proof.Items()
+		if err != nil {
+			return fmt.Errorf("AccountRange: invalid proof: %v", err)
+		}
+
 		// Ensure the ranges are monotonically increasing
-		for i, slots := range res.Slots {
+		for i, slots := range slotLists {
 			for j := 1; j < len(slots); j++ {
 				if bytes.Compare(slots[j-1].Hash[:], slots[j].Hash[:]) >= 0 {
 					return fmt.Errorf("storage slots not monotonically increasing for account #%d: #%d [%x] vs #%d [%x]", i, j-1, slots[j-1].Hash[:], j, slots[j].Hash[:])
 				}
 			}
 		}
-		requestTracker.Fulfil(peer.id, peer.version, StorageRangesMsg, res.ID)
 
-		return backend.Handle(peer, res)
+		return backend.Handle(peer, &StorageRangesPacket{res.ID, slotLists, proof})
 
 	case msg.Code == GetByteCodesMsg:
-		// Decode bytecode retrieval request
 		var req GetByteCodesPacket
 		if err := msg.Decode(&req); err != nil {
 			return fmt.Errorf("%w: message %v: %v", errDecode, msg, err)
@@ -236,17 +266,25 @@ func HandleMessage(backend Backend, peer *Peer) error {
 		})
 
 	case msg.Code == ByteCodesMsg:
-		// A batch of byte codes arrived to one of our previous requests
-		res := new(ByteCodesPacket)
+		res := new(byteCodesInput)
 		if err := msg.Decode(res); err != nil {
 			return fmt.Errorf("%w: message %v: %v", errDecode, msg, err)
 		}
-		requestTracker.Fulfil(peer.id, peer.version, ByteCodesMsg, res.ID)
 
-		return backend.Handle(peer, res)
+		length := res.Codes.Len()
+		tresp := tracker.Response{ID: res.ID, MsgCode: ByteCodesMsg, Size: length}
+		if err := peer.tracker.Fulfil(tresp); err != nil {
+			return fmt.Errorf("ByteCodes: %w", err)
+		}
+
+		codes, err := res.Codes.Items()
+		if err != nil {
+			return fmt.Errorf("ByteCodes: %w", err)
+		}
+
+		return backend.Handle(peer, &ByteCodesPacket{res.ID, codes})
 
 	case msg.Code == GetTrieNodesMsg:
-		// Decode trie node retrieval request
 		var req GetTrieNodesPacket
 		if err := msg.Decode(&req); err != nil {
 			return fmt.Errorf("%w: message %v: %v", errDecode, msg, err)
@@ -263,14 +301,21 @@ func HandleMessage(backend Backend, peer *Peer) error {
 		})
 
 	case msg.Code == TrieNodesMsg:
-		// A batch of trie nodes arrived to one of our previous requests
-		res := new(TrieNodesPacket)
+		res := new(trieNodesInput)
 		if err := msg.Decode(res); err != nil {
 			return fmt.Errorf("%w: message %v: %v", errDecode, msg, err)
 		}
-		requestTracker.Fulfil(peer.id, peer.version, TrieNodesMsg, res.ID)
 
-		return backend.Handle(peer, res)
+		tresp := tracker.Response{ID: res.ID, MsgCode: TrieNodesMsg, Size: res.Nodes.Len()}
+		if err := peer.tracker.Fulfil(tresp); err != nil {
+			return fmt.Errorf("TrieNodes: %w", err)
+		}
+		nodes, err := res.Nodes.Items()
+		if err != nil {
+			return fmt.Errorf("TrieNodes: %w", err)
+		}
+
+		return backend.Handle(peer, &TrieNodesPacket{res.ID, nodes})
 
 	default:
 		return fmt.Errorf("%w: %v", errInvalidMsgCode, msg.Code)
@@ -288,7 +333,16 @@ func ServiceGetAccountRangeQuery(chain *core.BlockChain, req *GetAccountRangePac
 	if err != nil {
 		return nil, nil
 	}
-	it, err := chain.Snapshots().AccountIterator(req.Root, req.Origin)
+	// Temporary solution: using the snapshot interface for both cases.
+	// This can be removed once the hash scheme is deprecated.
+	var it snapshot.AccountIterator
+	if chain.TrieDB().Scheme() == rawdb.HashScheme {
+		// The snapshot is assumed to be available in hash mode if
+		// the SNAP protocol is enabled.
+		it, err = chain.Snapshots().AccountIterator(req.Root, req.Origin)
+	} else {
+		it, err = chain.TrieDB().AccountIterator(req.Root, req.Origin)
+	}
 	if err != nil {
 		return nil, nil
 	}
@@ -332,11 +386,7 @@ func ServiceGetAccountRangeQuery(chain *core.BlockChain, req *GetAccountRangePac
 			return nil, nil
 		}
 	}
-	var proofs [][]byte
-	for _, blob := range proof.List() {
-		proofs = append(proofs, blob)
-	}
-	return accounts, proofs
+	return accounts, proof.List()
 }
 
 func ServiceGetStorageRangesQuery(chain *core.BlockChain, req *GetStorageRangesPacket) ([][]*StorageData, [][]byte) {
@@ -372,7 +422,19 @@ func ServiceGetStorageRangesQuery(chain *core.BlockChain, req *GetStorageRangesP
 			limit, req.Limit = common.BytesToHash(req.Limit), nil
 		}
 		// Retrieve the requested state and bail out if non existent
-		it, err := chain.Snapshots().StorageIterator(req.Root, account, origin)
+		var (
+			err error
+			it  snapshot.StorageIterator
+		)
+		// Temporary solution: using the snapshot interface for both cases.
+		// This can be removed once the hash scheme is deprecated.
+		if chain.TrieDB().Scheme() == rawdb.HashScheme {
+			// The snapshot is assumed to be available in hash mode if
+			// the SNAP protocol is enabled.
+			it, err = chain.Snapshots().StorageIterator(req.Root, account, origin)
+		} else {
+			it, err = chain.TrieDB().StorageIterator(req.Root, account, origin)
+		}
 		if err != nil {
 			return nil, nil
 		}
@@ -438,9 +500,7 @@ func ServiceGetStorageRangesQuery(chain *core.BlockChain, req *GetStorageRangesP
 					return nil, nil
 				}
 			}
-			for _, blob := range proof.List() {
-				proofs = append(proofs, blob)
-			}
+			proofs = append(proofs, proof.List()...)
 			// Proof terminates the reply as proofs are only added if a node
 			// refuses to serve more data (exception when a contract fetch is
 			// finishing, but that's that).
@@ -469,7 +529,7 @@ func ServiceGetByteCodesQuery(chain *core.BlockChain, req *GetByteCodesPacket) [
 			// Peers should not request the empty code, but if they do, at
 			// least sent them back a correct response without db lookups
 			codes = append(codes, []byte{})
-		} else if blob, err := chain.ContractCodeWithPrefix(hash); err == nil {
+		} else if blob := chain.ContractCodeWithPrefix(hash); len(blob) > 0 {
 			codes = append(codes, blob)
 			bytes += uint64(len(blob))
 		}
@@ -494,23 +554,41 @@ func ServiceGetTrieNodesQuery(chain *core.BlockChain, req *GetTrieNodesPacket, s
 		// We don't have the requested state available, bail out
 		return nil, nil
 	}
-	// The 'snap' might be nil, in which case we cannot serve storage slots.
-	snap := chain.Snapshots().Snapshot(req.Root)
+	// The 'reader' might be nil, in which case we cannot serve storage slots
+	// via snapshot.
+	var reader database.StateReader
+	if chain.Snapshots() != nil {
+		reader = chain.Snapshots().Snapshot(req.Root)
+	}
+	if reader == nil {
+		reader, _ = triedb.StateReader(req.Root)
+	}
+
 	// Retrieve trie nodes until the packet size limit is reached
 	var (
-		nodes [][]byte
-		bytes uint64
-		loads int // Trie hash expansions to count database reads
+		outerIt = req.Paths.ContentIterator()
+		nodes   [][]byte
+		bytes   uint64
+		loads   int // Trie hash expansions to count database reads
 	)
-	for _, pathset := range req.Paths {
-		switch len(pathset) {
+	for outerIt.Next() {
+		innerIt, err := rlp.NewListIterator(outerIt.Value())
+		if err != nil {
+			return nodes, err
+		}
+
+		switch innerIt.Count() {
 		case 0:
 			// Ensure we penalize invalid requests
 			return nil, fmt.Errorf("%w: zero-item pathset requested", errBadRequest)
 
 		case 1:
 			// If we're only retrieving an account trie node, fetch it directly
-			blob, resolved, err := accTrie.GetNode(pathset[0])
+			accKey := nextBytes(&innerIt)
+			if accKey == nil {
+				return nodes, fmt.Errorf("%w: invalid account node request", errBadRequest)
+			}
+			blob, resolved, err := accTrie.GetNode(accKey)
 			loads += resolved // always account database reads, even for failures
 			if err != nil {
 				break
@@ -519,32 +597,41 @@ func ServiceGetTrieNodesQuery(chain *core.BlockChain, req *GetTrieNodesPacket, s
 			bytes += uint64(len(blob))
 
 		default:
-			var stRoot common.Hash
 			// Storage slots requested, open the storage trie and retrieve from there
-			if snap == nil {
+			accKey := nextBytes(&innerIt)
+			if accKey == nil {
+				return nodes, fmt.Errorf("%w: invalid account storage request", errBadRequest)
+			}
+			var stRoot common.Hash
+			if reader == nil {
 				// We don't have the requested state snapshotted yet (or it is stale),
 				// but can look up the account via the trie instead.
-				account, err := accTrie.GetAccountByHash(common.BytesToHash(pathset[0]))
+				account, err := accTrie.GetAccountByHash(common.BytesToHash(accKey))
 				loads += 8 // We don't know the exact cost of lookup, this is an estimate
 				if err != nil || account == nil {
 					break
 				}
 				stRoot = account.Root
 			} else {
-				account, err := snap.Account(common.BytesToHash(pathset[0]))
+				account, err := reader.Account(common.BytesToHash(accKey))
 				loads++ // always account database reads, even for failures
 				if err != nil || account == nil {
 					break
 				}
 				stRoot = common.BytesToHash(account.Root)
 			}
-			id := trie.StorageTrieID(req.Root, common.BytesToHash(pathset[0]), stRoot)
+
+			id := trie.StorageTrieID(req.Root, common.BytesToHash(accKey), stRoot)
 			stTrie, err := trie.NewStateTrie(id, triedb)
 			loads++ // always account database reads, even for failures
 			if err != nil {
 				break
 			}
-			for _, path := range pathset[1:] {
+			for innerIt.Next() {
+				path, _, err := rlp.SplitString(innerIt.Value())
+				if err != nil {
+					return nil, fmt.Errorf("%w: invalid storage key: %v", errBadRequest, err)
+				}
 				blob, resolved, err := stTrie.GetNode(path)
 				loads += resolved // always account database reads, even for failures
 				if err != nil {
@@ -565,6 +652,17 @@ func ServiceGetTrieNodesQuery(chain *core.BlockChain, req *GetTrieNodesPacket, s
 		}
 	}
 	return nodes, nil
+}
+
+func nextBytes(it *rlp.Iterator) []byte {
+	if !it.Next() {
+		return nil
+	}
+	content, _, err := rlp.SplitString(it.Value())
+	if err != nil {
+		return nil
+	}
+	return content
 }
 
 // NodeInfo represents a short summary of the `snap` sub-protocol metadata
